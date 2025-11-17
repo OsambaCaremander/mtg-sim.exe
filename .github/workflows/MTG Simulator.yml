@@ -1,0 +1,697 @@
+name: Build Full MTG-Sim Project and EXE (All-in-One YAML)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Recreate project files (write embedded project)
+        shell: bash
+        run: |
+          echo "Writing project files..."
+
+          # --- Python engine
+          cat > mtg_sim_two_deck.py <<'PYEOF'
+#!/usr/bin/env python3
+"""
+mtg_sim_two_deck.py
+Improved 2-deck MTG simulator using Scryfall, heuristic oracle parsing, and colored-mana basics.
+Limitations: not a full rules engine. Heuristic-based parsing for many common cards.
+"""
+import argparse, json, os, random, re, sys, time
+from collections import deque, Counter, defaultdict
+from copy import deepcopy
+
+try:
+    import requests
+except Exception:
+    print("Missing 'requests'. Install: pip install requests")
+    raise
+
+SCRYFALL_NAMED = 'https://api.scryfall.com/cards/named?exact={}'
+
+CACHE_DEFAULT = 'scryfall_cache.json'
+
+def load_cache(path):
+    if os.path.exists(path):
+        try:
+            with open(path,'r',encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache,path):
+    with open(path,'w',encoding='utf-8') as f:
+        json.dump(cache,f,ensure_ascii=False,indent=2)
+
+def fetch_card(name, cache, session=None, polite_delay=0.08):
+    if name in cache: return cache[name]
+    s = session or requests
+    url = SCRYFALL_NAMED.format(requests.utils.requote_uri(name))
+    r = s.get(url)
+    if r.status_code != 200:
+        raise RuntimeError(f"Scryfall error for '{name}': {r.status_code} {r.text}")
+    data = r.json()
+    image = None
+    if data.get('image_uris'):
+        image = data['image_uris'].get('normal') or next(iter(data['image_uris'].values()))
+    elif data.get('card_faces'):
+        image = (data['card_faces'][0].get('image_uris') or {}).get('normal')
+    entry = {
+        'name': data.get('name'),
+        'mana_cost': data.get('mana_cost',''),
+        'cmc': data.get('cmc',0),
+        'type_line': data.get('type_line',''),
+        'oracle_text': data.get('oracle_text','') or '\\n'.join(cf.get('oracle_text','') for cf in data.get('card_faces',[])),
+        'power': data.get('power'),
+        'toughness': data.get('toughness'),
+        'colors': data.get('colors',[]),
+        'image': image,
+        'raw': data,
+    }
+    cache[name] = entry
+    time.sleep(polite_delay)
+    return entry
+
+# Deck parsing
+def parse_deckfile(path):
+    entries = []
+    with open(path,'r',encoding='utf-8') as f:
+        for line in f:
+            ln = line.strip()
+            if not ln or ln.startswith('#'): continue
+            m = re.match(r'^\\s*(\\d+)\\s+\\|?\\s*(.+)$', ln)
+            if m:
+                cnt = int(m.group(1)); name = m.group(2).strip()
+            else:
+                m2 = re.match(r'^(.+?)\\s+x(\\d+)$', ln, re.I)
+                if m2:
+                    name = m2.group(1).strip(); cnt = int(m2.group(2))
+                else:
+                    parts = ln.split()
+                    if parts and parts[0].isdigit():
+                        cnt = int(parts[0]); name = ' '.join(parts[1:]).strip()
+                    else:
+                        cnt = 1; name = ln
+            entries.append((name,cnt))
+    return entries
+
+# Heuristic parsing
+RE_PATTERNS = [
+    (re.compile(r"deal(?:s)?\\s+(\\d+)\\s+damage\\s+to\\s+(?:any\\s+target|target|target\\s+player|target\\s+creature)"), lambda m: {'type':'damage','amt':int(m.group(1))}),
+    (re.compile(r"deal(?:s)?\\s+(\\d+)\\s+damage\\s+to\\s+each\\s+opponent"), lambda m: {'type':'damage_each_opponent','amt':int(m.group(1))}),
+    (re.compile(r"draw\\s+(\\d+)\\s+card"), lambda m: {'type':'draw','amt':int(m.group(1))}),
+    (re.compile(r"scry\\s+(\\d+)"), lambda m: {'type':'scry','amt':int(m.group(1))}),
+    (re.compile(r"mill\\s+(\\d+)"), lambda m: {'type':'mill','amt':int(m.group(1))}),
+    (re.compile(r"create\\s+([0-9]+)\\s+([a-zA-Z0-9 '\\-]+?)\\s+token"), lambda m: {'type':'create_token','amt':int(m.group(1)),'desc':m.group(2).strip()}),
+    (re.compile(r"destroy\\s+target\\s+creature"), lambda m: {'type':'destroy_target_creature'}),
+    (re.compile(r"exile\\s+target"), lambda m: {'type':'exile_target'}),
+    (re.compile(r"return\\s+target\\s+.*to\\s+its\\s+owner'?s\\s+hand"), lambda m: {'type':'bounce_target'}),
+    (re.compile(r"from\\s+your\\s+graveyard,\\s+return\\s+.*"), lambda m: {'type':'reanimate'}),
+    (re.compile(r"sacrifice\\s+target\\s+creature"), lambda m: {'type':'sac_target'}),
+    (re.compile(r"counter\\s+target\\s+spell"), lambda m: {'type':'counter_target'}),
+    (re.compile(r"you\\s+gain\\s+(\\d+)\\s+life"), lambda m: {'type':'gain_life','amt':int(m.group(1))}),
+    (re.compile(r"target\\s+.*gets?\\s+\\+?([+-]?\\d+)/\\+?([+-]?\\d+)"), lambda m: {'type':'pump','pow':int(m.group(1)),'tgh':int(m.group(2))}),
+    (re.compile(r"haste"), lambda m: {'type':'keyword','name':'haste'}),
+    (re.compile(r"flash"), lambda m: {'type':'keyword','name':'flash'}),
+    (re.compile(r"lifelink"), lambda m: {'type':'keyword','name':'lifelink'}),
+    (re.compile(r"deathtouch"), lambda m: {'type':'keyword','name':'deathtouch'}),
+    (re.compile(r"hexproof"), lambda m: {'type':'keyword','name':'hexproof'}),
+]
+
+def parse_oracle_effects(card_entry):
+    text = (card_entry.get('oracle_text') or '').lower()
+    effects = []
+    for patt, fn in RE_PATTERNS:
+        for m in patt.finditer(text):
+            try:
+                eff = fn(m)
+                effects.append(eff)
+            except Exception:
+                continue
+    if 'instant' in (card_entry.get('type_line') or '').lower():
+        effects.append({'type':'instant'})
+    if 'sorcery' in (card_entry.get('type_line') or '').lower():
+        effects.append({'type':'sorcery'})
+    if 'creature' in (card_entry.get('type_line') or '').lower():
+        effects.append({'type':'creature','power':card_entry.get('power'),'toughness':card_entry.get('toughness')})
+    if 'land' in (card_entry.get('type_line') or '').lower():
+        effects.append({'type':'land'})
+    return effects
+
+# Mana parsing & basic colored model
+def parse_mana_cost_str(mana_str):
+    # returns dict { 'C':n, 'R':x, ... }
+    res = defaultdict(int)
+    if not mana_str:
+        return {'C':0}
+    s = mana_str.replace('{','').replace('}','')
+    toks = re.findall(r'\\d+|[WUBRGX]', s)
+    for t in toks:
+        if t.isdigit():
+            res['C'] += int(t)
+        else:
+            res[t] += 1
+    return dict(res)
+
+BASIC_LAND_PRODUCE = {
+    'mountain': {'R':1},
+    'forest': {'G':1},
+    'plains': {'W':1},
+    'island': {'U':1},
+    'swamp': {'B':1},
+}
+
+class CardInstance:
+    def __init__(self, template):
+        self.name = template['name']
+        self.template = template
+        self.type_line = template.get('type_line','')
+        self.mana_cost = template.get('mana_cost','')
+        self.parsed_cost = parse_mana_cost_str(self.mana_cost)
+        self.cmc = template.get('cmc',0)
+        self.oracle_text = template.get('oracle_text','')
+        self.power = template.get('power')
+        self.toughness = template.get('toughness')
+        self.effects = parse_oracle_effects(template)
+        self.uid = f"{self.name}--{random.randrange(10**9)}"
+        self.tapped = False
+        self.summoning_sick = any(e.get('type')=='creature' for e in self.effects)
+
+    def is_land(self): return any(e['type']=='land' for e in self.effects)
+    def is_creature(self): return any(e['type']=='creature' for e in self.effects)
+    def is_instant_or_sorcery(self): return any(e['type'] in ('instant','sorcery') for e in self.effects)
+
+class PlayerState:
+    def __init__(self, name, decklist):
+        self.name = name
+        self.library = deque(decklist)
+        self.hand = []
+        self.battlefield = []
+        self.graveyard = []
+        self.exile = []
+        self.life = 20
+        self.lands_played = 0
+
+    def draw(self,n=1):
+        drawn=[]
+        for _ in range(n):
+            if not self.library: break
+            drawn.append(self.library.popleft())
+        self.hand.extend(drawn)
+        return drawn
+
+    def shuffle_library(self):
+        tmp=list(self.library); random.shuffle(tmp); self.library = deque(tmp)
+
+    def play_land(self):
+        if self.lands_played >= 1: return None
+        for i,c in enumerate(self.hand):
+            if c.is_land():
+                card=self.hand.pop(i); card.tapped=False; self.battlefield.append(card); self.lands_played+=1; return card
+        return None
+
+    def available_mana_colored(self):
+        mana = defaultdict(int)
+        for c in self.battlefield:
+            if c.is_land() and not c.tapped:
+                name = (c.template.get('name') or '').lower()
+                prod = BASIC_LAND_PRODUCE.get(name)
+                if prod:
+                    for k,v in prod.items(): mana[k]+=v
+                else:
+                    mana['C'] += 1
+        return dict(mana)
+
+    def untap_all(self):
+        for c in self.battlefield: c.tapped=False
+        self.lands_played = 0
+
+class GameEngine:
+    def __init__(self, playerA, playerB, max_turns=8, logger=None):
+        self.players=[playerA,playerB]; self.max_turns=max_turns; self.turn=1; self.active_idx=0
+        self.log=[]; self.json_trace=[]; self.logger=logger
+
+    def log_action(self,text):
+        ts=time.time(); msg={'t':ts,'turn':self.turn,'player':self.players[self.active_idx].name,'text':text}
+        self.log.append(msg); self.json_trace.append(msg)
+        if self.logger: self.logger(msg)
+
+    def run_one_game(self):
+        for p in self.players:
+            p.shuffle_library(); drawn=p.draw(7); self.log_action(f"{p.name} draws opening hand ({len(drawn)})")
+        for t in range(1,self.max_turns+1):
+            self.turn=t
+            for active in (0,1):
+                self.active_idx=active; player=self.players[active]; opp=self.players[1-active]
+                self.log_action(f"--- Turn {t} start for {player.name}")
+                player.untap_all()
+                drawn=player.draw(1)
+                if drawn: self.log_action(f"{player.name} draws {drawn[0].name}")
+                land = player.play_land()
+                if land: self.log_action(f"{player.name} plays land {land.name}")
+                # cast loop (creatures & sorceries)
+                while True:
+                    mana = player.available_mana_colored()
+                    # find non-instant spells playable
+                    candidates = [c for c in player.hand if (c.is_creature() or 'sorcery' in (c.template.get('type_line') or '').lower()) and self.can_pay_cost(player, c.parsed_cost)]
+                    if not candidates: break
+                    candidates = sorted(candidates, key=lambda c: c.cmc)
+                    card = candidates[0]; self.pay_cost(player, card.parsed_cost); player.hand.remove(card)
+                    if card.is_creature():
+                        card.summoning_sick=True; player.battlefield.append(card); self.log_action(f"{player.name} casts creature {card.name}")
+                    else:
+                        self.resolve_card_effects(player, opp, card); player.graveyard.append(card)
+                # instants main-phase
+                instants=[c for c in list(player.hand) if c.is_instant_or_sorcery() and self.can_pay_cost(player,c.parsed_cost)]
+                for it in sorted(instants,key=lambda c:c.cmc):
+                    self.pay_cost(player,it.parsed_cost); player.hand.remove(it); self.resolve_card_effects(player,opp,it); player.graveyard.append(it)
+                # combat
+                attackers=[c for c in player.battlefield if c.is_creature() and (not c.summoning_sick)]
+                if attackers:
+                    self.log_action(f"{player.name} attacks with: {', '.join([a.name for a in attackers])}")
+                    blockers=self.choose_blockers(opp,attackers)
+                    self.resolve_combat(player,opp,attackers,blockers)
+                for c in player.battlefield: c.summoning_sick=False
+                if opp.life<=0:
+                    self.log_action(f"{player.name} wins by reducing opponent to {opp.life}"); return {'winner':player.name,'turn':t}
+        self.log_action('No winner within max turns'); return {'winner':None,'turn':self.max_turns}
+
+    def can_pay_cost(self, player, cost):
+        have = player.available_mana_colored()
+        # check colors
+        for col in ['W','U','B','R','G']:
+            if cost.get(col,0) > have.get(col,0): return False
+        total_need = cost.get('C',0) + sum(cost.get(c,0) for c in ['W','U','B','R','G'])
+        total_have = sum(have.values())
+        return total_have >= total_need
+
+    def pay_cost(self, player, cost):
+        # greedy payment: satisfy colors first by tapping matching lands, then generic
+        needed = dict(cost)
+        # tap lands producing required colors
+        for land in player.battlefield:
+            if not land.is_land() or land.tapped: continue
+            name = (land.template.get('name') or '').lower()
+            prod = BASIC_LAND_PRODUCE.get(name)
+            if prod:
+                for col in prod:
+                    if needed.get(col,0) > 0:
+                        land.tapped=True
+                        needed[col] = max(0, needed[col]-prod[col])
+                        break
+            else:
+                # generic land
+                if needed.get('C',0) > 0:
+                    land.tapped=True
+                    needed['C'] -= 1
+        # if still generic needed, tap any remaining lands
+        if needed.get('C',0) > 0:
+            for land in player.battlefield:
+                if land.is_land() and not land.tapped and needed['C']>0:
+                    land.tapped=True; needed['C'] -= 1
+
+    def resolve_card_effects(self, player, opp, card):
+        applied=False
+        for eff in card.effects:
+            t=eff.get('type')
+            if t in ('damage','damage_target'):
+                amt=eff.get('amt',0); opp.life -= amt; self.log_action(f"{card.name} deals {amt} to {opp.name} (now {opp.life})"); applied=True
+            elif t=='damage_each_opponent':
+                amt=eff.get('amt',0); opp.life -= amt; self.log_action(f"{card.name} deals {amt} to each opponent (now {opp.name} {opp.life})"); applied=True
+            elif t=='draw':
+                n=eff.get('amt',1); drawn=player.draw(n); self.log_action(f"{player.name} draws {len(drawn)} from {card.name}"); applied=True
+            elif t=='create_token':
+                desc=eff.get('desc','token'); amt=eff.get('amt',1)
+                for i in range(amt):
+                    token = CardInstance({'name':f"{desc} token",'type_line':'Creature','mana_cost':'','cmc':0,'oracle_text':'','power':'1','toughness':'1'})
+                    token.summoning_sick=False; player.battlefield.append(token)
+                self.log_action(f"{player.name} creates {amt} {desc} token(s)"); applied=True
+            elif t=='destroy_target_creature':
+                target=self.choose_target_creature_to_destroy(opp)
+                if target:
+                    try: opp.battlefield.remove(target)
+                    except: pass
+                    opp.graveyard.append(target); self.log_action(f"{card.name} destroys {opp.name}'s {target.name}"); applied=True
+            elif t=='exile_target':
+                if opp.graveyard:
+                    c=opp.graveyard.pop(0); opp.exile.append(c); self.log_action(f"{card.name} exiles {opp.name}'s {c.name} from graveyard"); applied=True
+            elif t=='bounce_target':
+                tgt=self.choose_largest_creature(opp)
+                if tgt:
+                    try: opp.battlefield.remove(tgt)
+                    except: pass
+                    opp.hand.append(tgt); self.log_action(f"{card.name} returns {opp.name}'s {tgt.name} to hand"); applied=True
+            elif t=='gain_life':
+                n=eff.get('amt',0); player.life += n; self.log_action(f"{player.name} gains {n} life (now {player.life})"); applied=True
+            elif t=='counter_target':
+                self.log_action(f"{card.name} would counter a spell but stack not modeled"); applied=True
+        if not applied:
+            self.log_action(f"{card.name} resolves with no parsed effects")
+
+    def choose_target_creature_to_destroy(self, opponent):
+        creatures=[c for c in opponent.battlefield if c.is_creature()]
+        if not creatures: return None
+        creatures_sorted = sorted(creatures, key=lambda c: (int(c.power) if c.power and str(c.power).isdigit() else 1, int(c.cmc) if c.cmc else 0), reverse=True)
+        return creatures_sorted[0]
+
+    def choose_largest_creature(self, opponent):
+        return self.choose_target_creature_to_destroy(opponent)
+
+    def choose_blockers(self, defending_player, attackers):
+        blocks={}
+        defenders=[c for c in defending_player.battlefield if c.is_creature()]
+        if not defenders: return blocks
+        att_sorted = sorted(attackers, key=lambda c: int(c.power) if c.power and str(c.power).isdigit() else 1, reverse=True)
+        def_sorted = sorted(defenders, key=lambda c: (int(c.toughness) if c.toughness and str(c.toughness).isdigit() else 1, - (int(c.power) if c.power and str(c.power).isdigit() else 0)))
+        used=set()
+        for att in att_sorted:
+            candidates=[d for d in def_sorted if d.uid not in used]
+            killers=[d for d in candidates if int(d.power or 1) >= (int(att.toughness or 1))]
+            chosen=None
+            if killers:
+                chosen=min(killers, key=lambda x:int(x.toughness or 1))
+            else:
+                if candidates:
+                    chosen=max(candidates, key=lambda x:int(x.power or 0))
+            if chosen:
+                blocks[att.uid]=chosen; used.add(chosen.uid)
+        if blocks:
+            self.log_action(f"{defending_player.name} blocks: " + ", ".join(f'{next((a.name for a in attackers if a.uid==k),k)}->{v.name}' for k,v in blocks.items()))
+        return blocks
+
+    def resolve_combat(self, attacker, defender, attackers, blocks):
+        for a in attackers:
+            if a.uid not in blocks:
+                dmg = int(a.power) if a.power and str(a.power).isdigit() else 1
+                defender.life -= dmg
+                self.log_action(f"{a.name} deals {dmg} to {defender.name} (now {defender.life})")
+            else:
+                b = blocks[a.uid]
+                atk_pw = int(a.power) if a.power and str(a.power).isdigit() else 1
+                blk_pw = int(b.power) if b.power and str(b.power).isdigit() else 1
+                if atk_pw >= int(b.toughness or 1):
+                    try: defender.battlefield.remove(b)
+                    except: pass
+                    defender.graveyard.append(b); self.log_action(f"{b.name} blocked and died")
+                if blk_pw >= int(a.toughness or 1):
+                    try: attacker.battlefield.remove(a)
+                    except: pass
+                    attacker.graveyard.append(a); self.log_action(f"{a.name} died in combat")
+
+def build_card_instances(cache, entries):
+    instances=[]
+    for name,cnt in entries:
+        if name not in cache:
+            raise RuntimeError(f"Card {name} not in cache; fetch or add to cache first")
+        template = cache[name]
+        for i in range(cnt):
+            instances.append(CardInstance(template))
+    return instances
+
+def main():
+    ap = argparse.ArgumentParser(description='MTG 2-deck simulator (Scryfall integrated)')
+    ap.add_argument('--deck-a', required=True)
+    ap.add_argument('--deck-b', required=True)
+    ap.add_argument('--games', type=int, default=10)
+    ap.add_argument('--max-turns', type=int, default=8)
+    ap.add_argument('--seed', type=int, default=None)
+    ap.add_argument('--cache-file', default=CACHE_DEFAULT)
+    ap.add_argument('--no-fetch', action='store_true', help='Do not fetch missing cards from Scryfall')
+    args = ap.parse_args()
+    if args.seed is not None: random.seed(args.seed)
+    cache = load_cache(args.cache_file)
+    deckA_entries = parse_deckfile(args.deck_a)
+    deckB_entries = parse_deckfile(args.deck_b)
+    missing = set([n for n,_ in deckA_entries] + [n for n,_ in deckB_entries]) - set(cache.keys())
+    if missing and args.no_fetch:
+        print('Missing in cache:', missing); sys.exit(1)
+    if missing:
+        print('Fetching',len(missing),'cards from Scryfall...')
+        s = requests.Session()
+        for nm in sorted(list(missing)):
+            try: fetch_card(nm, cache, session=s)
+            except Exception as e:
+                print('Error fetching', nm, e); sys.exit(1)
+        save_cache(cache, args.cache_file); print('Cache saved to', args.cache_file)
+    deckA_instances = build_card_instances(cache, deckA_entries)
+    deckB_instances = build_card_instances(cache, deckB_entries)
+    random.shuffle(deckA_instances); random.shuffle(deckB_instances)
+    playerA = PlayerState('A', deckA_instances); playerB = PlayerState('B', deckB_instances)
+    results = Counter(); traces=[]
+    for g in range(args.games):
+        pa=deepcopy(playerA); pb=deepcopy(playerB)
+        engine = GameEngine(pa,pb,max_turns=args.max_turns,logger=None)
+        res = engine.run_one_game()
+        results[res['winner'] if res['winner'] else 'NoWinner'] += 1
+        traces.append({'game':g+1,'winner':res['winner'],'turns':res['turn'],'log':engine.log})
+        print(f"Game {g+1}: winner={res['winner']} turn={res['turn']}")
+    print('Summary:',dict(results))
+    with open('game_traces.json','w',encoding='utf-8') as f: json.dump(traces,f,ensure_ascii=False,indent=2)
+    print('Traces saved to game_traces.json')
+
+if __name__ == '__main__':
+    main()
+PYEOF
+
+          # --- Electron main & preload
+          mkdir -p electron
+          cat > electron/main.js <<'JSEOF'
+const { app, BrowserWindow, ipcMain } = require('electron');
+const path = require('path');
+const { spawn } = require('child_process');
+
+function createWindow () {
+  const win = new BrowserWindow({
+    width: 1000,
+    height: 700,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true
+    }
+  });
+  const indexPath = path.join(__dirname, '..', 'ui-src', 'index.html');
+  win.loadFile(indexPath);
+}
+
+app.whenReady().then(createWindow);
+
+ipcMain.handle('run-sim', async (event, args) => {
+  return new Promise((resolve, reject) => {
+    const exeName = process.platform === 'win32' ? 'mtg-sim.exe' : 'mtg-sim';
+    const exePath = path.join(process.resourcesPath, exeName);
+    const tryPaths = [exePath, path.join(__dirname, '..', exeName), path.join(process.cwd(), exeName)];
+    let chosen = null;
+    for (const p of tryPaths) { try { require('fs').accessSync(p); chosen = p; break; } catch(e){} }
+    if (!chosen) { reject(new Error('mtg-sim executable not found')); return; }
+    const proc = spawn(chosen, ['--deck-a', args.deckA, '--deck-b', args.deckB, '--games', String(args.games)]);
+    let out = '';
+    proc.stdout.on('data', d => { out += d.toString(); });
+    proc.stderr.on('data', d => { out += d.toString(); });
+    proc.on('close', code => {
+      if (code === 0) resolve(out);
+      else resolve(out + '\\nProcess exited with code ' + code);
+    });
+  });
+});
+JSEOF
+
+          cat > electron/preload.js <<'JSEOF'
+const { contextBridge, ipcRenderer } = require('electron');
+contextBridge.exposeInMainWorld('electronAPI', {
+  runSim: (args) => ipcRenderer.invoke('run-sim', args)
+});
+JSEOF
+
+          # --- UI static
+          mkdir -p ui-src
+          cat > ui-src/index.html <<'HTMEOF'
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>MTG Sim UI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; background:#f6f7fb; }
+    .card { background: #fff; border-radius:8px; padding:12px; box-shadow:0 1px 3px rgba(0,0,0,0.08); margin-bottom:8px;}
+    pre { background:#0f1724; color:#d1d5db; padding:8px; border-radius:6px; white-space:pre-wrap;}
+    button { padding:8px 12px; border-radius:6px; border:none; background:#2563eb; color:white; cursor:pointer;}
+  </style>
+</head>
+<body>
+  <h1>MTG Sim (Electron UI)</h1>
+  <div class="card">
+    <p>This is a minimal UI. Use the packaged Python engine (mtg-sim.exe) to run matches.</p>
+    <p>To run simulation from UI, the Electron app launches the exe as a subprocess and returns console output.</p>
+    <button id="run">Run sample simulation</button>
+    <div id="out" style="margin-top:12px;"></div>
+  </div>
+  <script>
+    document.getElementById('run').addEventListener('click', async () => {
+      document.getElementById('out').innerHTML = '<pre>Launching engine...</pre>';
+      if (window.electronAPI && window.electronAPI.runSim) {
+        try {
+          const out = await window.electronAPI.runSim({deckA:'sample_decks/deckA.txt', deckB:'sample_decks/deckB.txt', games:3});
+          document.getElementById('out').innerHTML = '<pre>' + out + '</pre>';
+        } catch (e) {
+          document.getElementById('out').innerHTML = '<pre>Error: ' + e.message + '</pre>';
+        }
+      } else {
+        document.getElementById('out').innerHTML = '<pre>Electron API not available (are you running in Electron?)</pre>';
+      }
+    });
+  </script>
+</body>
+</html>
+HTMEOF
+
+          # --- package.json
+          cat > package.json <<'JSONEOF'
+{
+  "name": "mtg-sim-electron",
+  "version": "0.1.0",
+  "description": "MTG Sim desktop app bundling Python engine",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64"
+  },
+  "build": {
+    "appId": "com.example.mtg-sim",
+    "files": [
+      "electron/**",
+      "ui-src/**",
+      "mtg_sim_two_deck.py",
+      "mtg-sim.exe",
+      "scryfall_cache.json",
+      "sample_decks/**"
+    ],
+    "extraResources": [
+      {
+        "from": "dist/mtg-sim.exe",
+        "to": "mtg-sim.exe",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": ["nsis","portable"]
+    }
+  },
+  "devDependencies": {
+    "electron": "^26.0.0",
+    "electron-builder": "^24.8.0"
+  },
+  "dependencies": {}
+}
+JSONEOF
+
+          # --- sample decks
+          mkdir -p sample_decks
+          cat > sample_decks/deckA.txt <<'DEKA'
+20 Mountain
+20 Goblin Guide
+4 Lightning Bolt
+16 Grunt
+DEKA
+
+          cat > sample_decks/deckB.txt <<'DEKB'
+20 Forest
+20 Pelt Collector
+4 Giant Growth
+16 Boar
+DEKB
+
+          # --- README
+          cat > README.md <<'RME'
+# MTG Sim — Embedded All-in-One Project
+
+This repository is created by an all-in-one GitHub Actions workflow. The workflow writes project files, builds the Python engine and an Electron Windows app, and uploads artifacts.
+
+Files included:
+- mtg_sim_two_deck.py : Python engine
+- electron/ : Electron app (main, preload)
+- ui-src/ : Minimal static UI page for Electron
+- package.json : for electron-builder
+- sample_decks/ : example decks
+
+Usage: The workflow builds everything automatically on push to main or via manual dispatch.
+RME
+
+          echo "Files written."
+      # end write step
+
+      - name: Install Python deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pyinstaller
+
+      - name: Build Python single-file exe with PyInstaller
+        shell: bash
+        run: |
+          pyinstaller --onefile --name mtg-sim mtg_sim_two_deck.py
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ runner.temp }}
+
+      - name: Ensure mtg-sim.exe available in root & dist copy
+        shell: bash
+        run: |
+          # PyInstaller on windows places exe in dist/mtg-sim.exe
+          if [ -f dist/mtg-sim.exe ]; then
+            echo "Found dist/mtg-sim.exe"
+            cp dist/mtg-sim.exe mtg-sim.exe || true
+          else
+            echo "ERROR: dist/mtg-sim.exe not found"
+            ls -la
+            exit 1
+          fi
+
+      - name: Install Node modules
+        shell: bash
+        run: |
+          npm install
+        # increase timeout for npm installs
+        timeout-minutes: 20
+
+      - name: Build Electron App (Windows)
+        shell: bash
+        run: |
+          # electron-builder will produce artifacts under dist/
+          npx electron-builder --win --x64
+        env:
+          CSC_LINK: ""  # no code signing by default
+          CSC_KEY_PASSWORD: ""
+
+      - name: Upload Python exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtg-sim-python-exe
+          path: dist/mtg-sim.exe
+
+      - name: Upload Electron artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtg-sim-electron
+          path: dist/*.exe
