@@ -1,0 +1,75 @@
+# Extended RE_PATTERNS (drop-in replacement)
+RE_PATTERNS = [
+    # direct damage to any/target/player/creature
+    (re.compile(r"deal(?:s)?\s+(\d+)\s+damage\s+to\s+(?:any\s+target|target|target\s+player|target\s+creature)"), lambda m: {'type':'damage_target','amt':int(m.group(1))}),
+    # damage to each opponent / each creature / each player
+    (re.compile(r"deal(?:s)?\s+(\d+)\s+damage\s+to\s+each\s+opponent"), lambda m: {'type':'damage_each_opponent','amt':int(m.group(1))}),
+    (re.compile(r"deal(?:s)?\s+(\d+)\s+damage\s+to\s+each\s+creature"), lambda m: {'type':'damage_each_creature','amt':int(m.group(1))}),
+    # draw, scry, mill
+    (re.compile(r"draw\s+(\d+)\s+card"), lambda m: {'type':'draw','amt':int(m.group(1))}),
+    (re.compile(r"scry\s+(\d+)"), lambda m: {'type':'scry','amt':int(m.group(1))}),
+    (re.compile(r"mill\s+(\d+)"), lambda m: {'type':'mill','amt':int(m.group(1))}),
+    # create tokens: "create N ... token(s)"
+    (re.compile(r"create\s+([0-9]+)\s+([a-zA-Z0-9 '\-]+?)\s+token"), lambda m: {'type':'create_token','amt':int(m.group(1)),'desc':m.group(2).strip()}),
+    # destroy / exile / bounce / sacrifice / return-from-graveyard
+    (re.compile(r"destroy\s+target\s+creature"), lambda m: {'type':'destroy_target_creature'}),
+    (re.compile(r"exile\s+target"), lambda m: {'type':'exile_target'}),
+    (re.compile(r"return\s+target\s+.*to\s+its\s+owner'?s\s+hand"), lambda m: {'type':'bounce_target'}),
+    (re.compile(r"from\s+your\s+graveyard,\s+return\s+.*"), lambda m: {'type':'reanimate'}),
+    (re.compile(r"sacrifice\s+target\s+creature"), lambda m: {'type':'sac_target'}),
+    # counters / counterspell language
+    (re.compile(r"counter\s+target\s+spell"), lambda m: {'type':'counter_target'}),
+    # life gain
+    (re.compile(r"you\s+gain\s+(\d+)\s+life"), lambda m: {'type':'gain_life','amt':int(m.group(1))}),
+    # buffs / get +X/+Y until end of turn
+    (re.compile(r"target\s+.*gets?\s+\\+?([+-]?\\d+)/\\+?([+-]?\\d+)"), lambda m: {'type':'pump','pow':int(m.group(1)),'tgh':int(m.group(2))}),
+    # Keyword recognition
+    (re.compile(r"haste"), lambda m: {'type':'keyword','name':'haste'}),
+    (re.compile(r"flash"), lambda m: {'type':'keyword','name':'flash'}),
+    (re.compile(r"lifelink"), lambda m: {'type':'keyword','name':'lifelink'}),
+    (re.compile(r"deathtouch"), lambda m: {'type':'keyword','name':'deathtouch'}),
+    (re.compile(r"hexproof"), lambda m: {'type':'keyword','name':'hexproof'}),
+    # fallback: detect card types
+]
+Notes: these patterns are heuristic — they’ll correctly parse thousands of common cards (Lightning Bolt, Opt, Path to Exile, Raise Dead, etc.) but extremely complex templating (e.g., replacement/continuous effects, layers, state-based weirdness) will need hand-coded handlers.
+
+2) Colored-mana model (overview + code)
+I added a lightweight colored-mana model that:
+
+Parses mana cost strings like {1}{R}{G} or R and records a { 'R':1, 'G':1, 'C':1 } cost dict (C = colorless / generic).
+
+Lands are recognized by type_line and mapped to mana produced: Mountain → {R:1}, Forest → {G:1}, Plains → {W:1}, Island → {U:1}, Swamp → {B:1}, and also basic dual-lands or common fetches can be added to a map.
+
+Mana production is tracked as counts of colored mana from untapped lands; when casting, engine attempts to pay colored requirements first and generic with any remaining mana.
+
+Drop-in helper functions to add in engine:
+
+python
+Copy code
+MANA_SYMBOL_REGEX = re.compile(r'\{?([WUBRG0-9XCMC])\}?')  # simplified
+
+def parse_mana_cost_str(mana_str):
+    # return dict like {'R':1,'G':1,'C':2}
+    if not mana_str:
+        return {'C':0}
+    # convert formats like "{1}{R}" or "1R" heuristically
+    # remove braces for simple parsing
+    s = mana_str.replace('{','').replace('}','').replace('(','').replace(')','')
+    tokens = re.findall(r'\d+|[WUBRGX]|[0-9]+', s)
+    cost = defaultdict(int)
+    for t in tokens:
+        if t.isdigit():
+            cost['C'] += int(t)
+        else:
+            # WUBRG
+            cost[t] += 1
+    return dict(cost)
+
+# map basic land names (case-insensitive) to mana produced
+BASIC_LAND_PRODUCE = {
+    'mountain': {'R':1},
+    'forest': {'G':1},
+    'plains': {'W':1},
+    'island': {'U':1},
+    'swamp': {'B':1},
+}
