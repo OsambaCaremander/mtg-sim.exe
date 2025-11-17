@@ -1,0 +1,39 @@
+def can_pay_cost(player, cost_dict):
+    have = player.available_mana_colored()
+    # check colored
+    for col in ['W','U','B','R','G']:
+        need = cost_dict.get(col,0)
+        if have.get(col,0) < need:
+            return False
+    # check generic total
+    total_have = sum(have.values())
+    total_need = cost_dict.get('C',0) + sum(cost_dict.get(c,0) for c in ['W','U','B','R','G'])
+    return total_have >= total_need
+
+def pay_cost(player, cost_dict):
+    # taps actual lands in battlefield to produce mana - we need to choose which lands to tap to pay colors
+    # simple greedy: first satisfy colored needs by tapping lands that produce that color.
+    needed = cost_dict.copy()
+    # for each land, if untapped and produces a needed color, tap it and satisfy
+    for land in player.battlefield:
+        if land.is_land() and not land.tapped:
+            name = (land.template.get('name') or '').lower()
+            prod = BASIC_LAND_PRODUCE.get(name)
+            if not prod:
+                # generic producer
+                if needed.get('C',0) > 0:
+                    land.tapped = True
+                    needed['C'] = max(0, needed['C'] - 1)
+            else:
+                for col,amt in prod.items():
+                    if needed.get(col,0) > 0:
+                        land.tapped = True
+                        needed[col] = max(0, needed[col] - amt)
+                        break
+    # if still generic needed, tap any remaining untapped lands
+    if needed.get('C',0) > 0:
+        for land in player.battlefield:
+            if land.is_land() and not land.tapped and needed['C']>0:
+                land.tapped = True
+                needed['C'] -= 1
+    # no perfect accounting, but this greedy approach works for most decks

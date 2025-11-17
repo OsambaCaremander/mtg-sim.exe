@@ -1,0 +1,13 @@
+def available_mana_colored(self):
+    mana = defaultdict(int)
+    for c in self.battlefield:
+        # if land and not tapped
+        if c.is_land() and not c.tapped:
+            key = (c.template.get('name') or '').lower()
+            produced = BASIC_LAND_PRODUCE.get(key)
+            if produced:
+                for k,v in produced.items(): mana[k] += v
+            else:
+                # fallback: produce generic 1
+                mana['C'] += 1
+    return dict(mana)

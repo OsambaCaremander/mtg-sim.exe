@@ -1,0 +1,30 @@
+def choose_blockers(self, defending_player, attackers):
+    blocks = {}
+    defenders = [c for c in defending_player.battlefield if c.is_creature()]
+    if not defenders: return blocks
+
+    # sort attackers by (power, cmc) descending — defender wants to stop biggest threats
+    att_sorted = sorted(attackers, key=lambda c: (int(c.power) if c.power and str(c.power).isdigit() else 1, c.cmc), reverse=True)
+    # sort defenders by toughness ascending to use small creatures for trades, or by value
+    def_sorted = sorted(defenders, key=lambda c: (int(c.toughness) if c.toughness and str(c.toughness).isdigit() else 1, - (int(c.power) if c.power and str(c.power).isdigit() else 0)))
+
+    used = set()
+    for att in att_sorted:
+        # choose best defender for this attacker: prefer smallest defender that still kills attacker (toughness >= attacker power)
+        candidates = [d for d in def_sorted if d.uid not in used]
+        killers = [d for d in candidates if int(d.power or 1) >= (int(att.toughness or 1))]
+        # prefer exact trades: smallest toughness that >= att power
+        chosen = None
+        if killers:
+            chosen = min(killers, key=lambda x: int(x.toughness or 1))
+        else:
+            # else pick defender that deals most damage to attacker but survives if possible
+            # choose defender with highest power to at least trade
+            if candidates:
+                chosen = max(candidates, key=lambda x: int(x.power or 0))
+        if chosen:
+            blocks[att.uid] = chosen
+            used.add(chosen.uid)
+    if blocks:
+        self.log_action(f"{defending_player.name} blocks: " + ", ".join(f'{next(a.name for a in attackers if a.uid==k)}-> {v.name}' for k,v in blocks.items()))
+    return blocks
